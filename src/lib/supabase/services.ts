@@ -22,7 +22,14 @@ export async function getServices(): Promise<Service[]> {
         .eq('is_published', true)
         .order('display_order', { ascending: true });
 
-      if (!error && data && data.length > 0) {
+      if (error) {
+        console.error('[JUANET.cloud] Supabase services query failed:', error.message);
+        // Fall back to local canonical catalog only when database query fails
+        return servicesData;
+      }
+
+      if (data && data.length > 0) {
+        console.info(`[JUANET.cloud] Successfully loaded ${data.length} services from Supabase database.`);
         return data.map((item: any) => ({
           id: item.id,
           slug: item.slug as ServiceSlug,
@@ -41,10 +48,14 @@ export async function getServices(): Promise<Service[]> {
           isPublished: item.is_published,
           displayOrder: item.display_order,
         }));
+      } else {
+        console.warn('[JUANET.cloud] Supabase connected but services table returned 0 rows. Using canonical catalog.');
       }
     } catch (err) {
-      console.warn('[JUANET.cloud] Error querying Supabase services, using local catalog:', err);
+      console.error('[JUANET.cloud] Unexpected error querying Supabase services:', err);
     }
+  } else {
+    console.info('[JUANET.cloud] Supabase not configured; rendering local service catalog.');
   }
 
   // Fallback to verified local services catalog
@@ -73,7 +84,13 @@ export async function getPortfolioProjects(): Promise<PortfolioProject[]> {
         .order('is_featured', { ascending: false })
         .order('created_at', { ascending: false });
 
-      if (!error && data) {
+      if (error) {
+        console.error('[JUANET.cloud] Supabase portfolio_projects query failed:', error.message);
+        return [];
+      }
+
+      if (data) {
+        console.info(`[JUANET.cloud] Supabase portfolio query returned ${data.length} published projects.`);
         return data.map((p: any) => ({
           id: p.id,
           title: p.title,
@@ -98,7 +115,7 @@ export async function getPortfolioProjects(): Promise<PortfolioProject[]> {
         }));
       }
     } catch (err) {
-      console.warn('[JUANET.cloud] Error querying portfolio projects from Supabase:', err);
+      console.error('[JUANET.cloud] Unexpected error querying portfolio projects from Supabase:', err);
     }
   }
 
@@ -116,6 +133,7 @@ export async function getPortfolioProjectBySlug(slug: string): Promise<Portfolio
 
 /**
  * Submit an inquiry (contact, service quote, or consultation)
+ * Prefers Supabase Edge Function with automatic direct RLS-protected table fallback.
  */
 export async function submitInquiry(payload: InquiryPayload): Promise<InquirySubmissionResult> {
   // 1. Anti-spam honeypot verification
@@ -152,68 +170,126 @@ export async function submitInquiry(payload: InquiryPayload): Promise<InquirySub
   // 3. Generate reference code
   const referenceCode = generateReferenceCode(payload.inquiryType);
 
-  // 4. If Supabase is configured, insert into inquiries table
+  // 4. If Supabase is configured:
   if (isSupabaseConfigured && supabase) {
+    // 4A. Preferred submission path: Supabase Edge Function
+    let functionUnavailable = false;
     try {
-      const record = {
-        reference_code: referenceCode,
-        inquiry_type: payload.inquiryType,
-        full_name: payload.fullName.trim(),
-        email: payload.email.trim().toLowerCase(),
-        phone: payload.phone?.trim() || null,
-        organization: payload.organization?.trim() || null,
-        country: payload.country?.trim() || null,
-        preferred_contact_method: payload.preferredContactMethod || null,
-        subject: payload.subject?.trim() || null,
-        project_summary: payload.projectSummary?.trim() || null,
-        project_details: payload.projectDetails?.trim() || payload.message?.trim() || null,
-        project_url: payload.existingWebsiteUrl?.trim() || null,
-        budget_range: payload.budgetRange || null,
-        preferred_timeline: payload.preferredTimeline || null,
-        preferred_start_date: payload.desiredStartDate || null,
-        consultation_date: payload.preferredDate || null,
-        consultation_time_window: payload.preferredTimeWindow || null,
-        timezone: payload.timeZone || null,
-        privacy_consent: true,
-        consent_recorded_at: new Date().toISOString(),
-        status: 'new',
-        project_metadata: {
-          serviceSlug: payload.serviceSlug,
-          intendedAudience: payload.intendedAudience,
-          preferredTechnologies: payload.preferredTechnologies,
-          consultationTopic: payload.consultationTopic,
-          consultationDescription: payload.consultationDescription,
-        },
-      };
+      const { data: edgeData, error: edgeError } = await supabase.functions.invoke(
+        'submit-inquiry',
+        {
+          body: {
+            ...payload,
+            referenceCode,
+          },
+        }
+      );
 
-      const { error } = await supabase.from('inquiries').insert([record]);
-
-      if (error) {
-        console.error('[JUANET.cloud] Database insert error:', error);
+      if (!edgeError && edgeData && edgeData.success) {
+        console.info('[JUANET.cloud] Inquiry successfully processed via Edge Function:', edgeData.referenceCode);
         return {
-          success: false,
-          referenceCode,
-          message: `Database submission failed: ${error.message}. Please reach out directly or try again.`,
+          success: true,
+          referenceCode: edgeData.referenceCode || referenceCode,
+          message: 'Your inquiry has been successfully received. We will review your details and respond promptly.',
         };
       }
 
-      return {
-        success: true,
-        referenceCode,
-        message: 'Your inquiry has been successfully received. We will review your details and respond promptly.',
-      };
-    } catch (err: any) {
-      console.error('[JUANET.cloud] Unexpected submission error:', err);
-      return {
-        success: false,
-        referenceCode,
-        message: `An unexpected error occurred: ${err.message || 'Please contact us directly.'}`,
-      };
+      const edgeStatus = (edgeError as any)?.context?.status;
+
+      // If Edge Function is not deployed (HTTP 404), mark as unavailable for fallback
+      if (edgeStatus === 404) {
+        functionUnavailable = true;
+        console.info('[JUANET.cloud] Edge Function submit-inquiry returned 404 (not deployed); using verified direct RLS table insert.');
+      } else if (edgeError) {
+        // Function is deployed and returned an intentional rejection or error (e.g. 400 validation, 429 rate limit, 500 error).
+        // DO NOT fall back to database; honor the server-side decision!
+        console.warn('[JUANET.cloud] Edge Function returned HTTP', edgeStatus || 'error');
+        let errorMsg = edgeError.message || 'Submission could not be completed.';
+        try {
+          const errBody = await (edgeError as any).context?.json();
+          if (errBody?.error) {
+            errorMsg = errBody.error;
+          }
+        } catch (_) {
+          // ignore json parse errors
+        }
+        return {
+          success: false,
+          referenceCode,
+          message: errorMsg,
+        };
+      }
+    } catch (edgeInvokeErr: any) {
+      // If network failed to reach the functions endpoint entirely
+      console.warn('[JUANET.cloud] Edge Function invoke network error:', edgeInvokeErr);
+      functionUnavailable = true;
+    }
+
+    // 4B. Direct RLS-protected table insert ONLY when function is unavailable
+    if (functionUnavailable) {
+      try {
+        const record = {
+          reference_code: referenceCode,
+          inquiry_type: payload.inquiryType,
+          full_name: payload.fullName.trim(),
+          email: payload.email.trim().toLowerCase(),
+          phone: payload.phone?.trim() || null,
+          organization: payload.organization?.trim() || null,
+          country: payload.country?.trim() || null,
+          preferred_contact_method: payload.preferredContactMethod || null,
+          subject: payload.subject?.trim() || null,
+          service_id: (typeof payload.serviceSlug === 'string' ? payload.serviceSlug : null),
+          project_summary: payload.projectSummary?.trim() || null,
+          project_details: payload.projectDetails?.trim() || payload.message?.trim() || null,
+          project_url: payload.existingWebsiteUrl?.trim() || null,
+          budget_range: payload.budgetRange || null,
+          preferred_timeline: payload.preferredTimeline || null,
+          preferred_start_date: payload.desiredStartDate || null,
+          consultation_date: payload.preferredDate || null,
+          consultation_time_window: payload.preferredTimeWindow || null,
+          timezone: payload.timeZone || null,
+          privacy_consent: true,
+          consent_recorded_at: new Date().toISOString(),
+          status: 'new',
+          project_metadata: {
+            serviceSlug: payload.serviceSlug,
+            intendedAudience: payload.intendedAudience,
+            preferredTechnologies: payload.preferredTechnologies,
+            consultationTopic: payload.consultationTopic,
+            consultationDescription: payload.consultationDescription,
+            viaGateway: 'direct_rls_table_fallback',
+          },
+        };
+
+        const { error: dbError } = await supabase.from('inquiries').insert([record]);
+
+        if (dbError) {
+          console.error('[JUANET.cloud] Database insert error:', dbError);
+          return {
+            success: false,
+            referenceCode,
+            message: `Database submission failed: ${dbError.message}. Please reach out directly or try again.`,
+          };
+        }
+
+        console.info('[JUANET.cloud] Inquiry successfully stored in Supabase table inquiries with ref:', referenceCode);
+        return {
+          success: true,
+          referenceCode,
+          message: 'Your inquiry has been successfully received. We will review your details and respond promptly.',
+        };
+      } catch (err: any) {
+        console.error('[JUANET.cloud] Unexpected submission error:', err);
+        return {
+          success: false,
+          referenceCode,
+          message: `An unexpected error occurred: ${err.message || 'Please contact us directly.'}`,
+        };
+      }
     }
   }
 
-  // 5. If Supabase is not yet configured (e.g. local preview or fresh deployment before DB keys)
-  // Store temporarily in sessionStorage for testing resilience
+  // 5. If Supabase is not configured (e.g. initial clone before setting keys)
   try {
     const existing = JSON.parse(sessionStorage.getItem('juanet_offline_inquiries') || '[]');
     existing.push({
@@ -230,6 +306,6 @@ export async function submitInquiry(payload: InquiryPayload): Promise<InquirySub
     success: true,
     referenceCode,
     message:
-      'Inquiry processed successfully in preview mode. To persist inquiries permanently in production, configure VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.',
+      'Inquiry processed in preview mode. To persist inquiries permanently in production, configure VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.',
   };
 }
