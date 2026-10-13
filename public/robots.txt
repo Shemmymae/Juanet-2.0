@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+
+# Disallow administrative or future portal paths
+Disallow: /admin/
+Disallow: /portal/
+
+Sitemap: https://juanet.cloud/sitemap.xml
