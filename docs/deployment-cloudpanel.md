@@ -1,101 +1,126 @@
-# JUANET.cloud — CloudPanel Static Deployment Guide
+# JUANET.cloud — Production Deployment Guide (Hostinger VPS & CloudPanel)
 
-This guide provides step-by-step instructions for deploying the **JUANET.cloud Phase 1 Frontend** to a production VPS running **CloudPanel**.
-
----
-
-## Architecture Summary
-- **Target Domain**: `https://juanet.cloud`
-- **Application Type**: High-performance Static Single-Page Application (SPA) built with Vite, React, and TypeScript.
-- **Server Software**: Nginx (managed through CloudPanel).
-- **Backend / Database**: External Supabase project (managed independently).
-- **Operational Requirement**: No persistent Node.js background process is required on the server. The application is served purely as static files through Nginx.
+This guide provides definitive, production-tested instructions for deploying the **JUANET.cloud Phase 1 Frontend** to a **Hostinger VPS** managed through **CloudPanel**, integrated with your existing **Supabase** backend (Project Ref: `qaxctkradwquzwyvrpfe`) and deployed Edge Function (`submit-inquiry`).
 
 ---
 
-## Step 1: Create Website in CloudPanel
+## 1. Architectural Separation
 
-1. Log into your CloudPanel admin interface: `https://your-server-ip:8443`.
+The platform consists of two decoupled, independently deployable components:
+
+| Component | Technology | Hosting Platform | Deployment Method |
+| :--- | :--- | :--- | :--- |
+| **Public Website (Frontend)** | Vite + React + TypeScript + Tailwind CSS | Hostinger VPS via CloudPanel (Nginx) | Static SPA Build (`dist/`) |
+| **Inquiry Gateway (Backend)** | Deno / Supabase Edge Functions | Supabase Cloud (`qaxctkradwquzwyvrpfe`) | GitHub Actions / Supabase CLI |
+| **Database & Storage** | PostgreSQL + Row Level Security (RLS) | Supabase Cloud | Managed Migrations |
+
+---
+
+## 2. Workstation & Build Prerequisites
+
+- **Node.js**: `v20.x` or `v22.x` (LTS)
+- **Package Manager**: `npm` (v10+)
+- **Build Output Directory**: `dist/` (static assets)
+- **Runtime Requirement on VPS**: **Pure Static Nginx Web Server**. No continuous Node.js background daemon (PM2, Docker, or tsx) is required or recommended on the VPS for Phase 1.
+
+---
+
+## 3. Environment Variable Configuration
+
+Because Vite compiles `import.meta.env.VITE_*` statically into the JavaScript bundle at build time, **environment variables must be present during `npm run build`**.
+
+Create your production `.env` file on your build machine (CI/CD runner or local terminal):
+
+```bash
+# -----------------------------------------------------------------------------
+# Supabase Configuration (Client-Safe Publishable Key ONLY)
+# Never place the SUPABASE_SERVICE_ROLE_KEY in this file!
+# -----------------------------------------------------------------------------
+VITE_SUPABASE_URL=https://qaxctkradwquzwyvrpfe.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=your-supabase-anon-or-publishable-key
+
+# Canonical Production URL
+VITE_SITE_URL=https://juanet.cloud
+
+# Optional Verified Business Contact Overrides (leave blank or omit to use defaults)
+VITE_CONTACT_EMAIL=contact@juanet.cloud
+VITE_CONTACT_PHONE=
+VITE_CONTACT_PHONE_DISPLAY=
+VITE_WHATSAPP_NUMBER=
+VITE_WHATSAPP_DISPLAY=
+VITE_PHYSICAL_LOCATION=Nairobi, Kenya & Remote Globally
+VITE_POSTAL_ADDRESS=
+
+# Optional Social Links (only rendered in UI if populated)
+VITE_SOCIAL_LINKEDIN=
+VITE_SOCIAL_TWITTER=
+VITE_SOCIAL_GITHUB=
+
+# Optional Scheduling Calendar (e.g. Cal.com or Calendly)
+VITE_SCHEDULING_URL=
+```
+
+> **SECURITY CHECK**: Confirm that `VITE_SUPABASE_PUBLISHABLE_KEY` is your public `anon` key (starts with `ey...` or `sb_publishable_...`). Never use your `service_role` key in frontend `.env` files.
+
+---
+
+## 4. Compile Production Static Assets
+
+Run the clean build process on your build workstation:
+
+```bash
+# 1. Install dependencies
+npm ci
+
+# 2. Type check
+npm run lint
+
+# 3. Build optimized static bundle
+npm run build
+```
+
+This compiles all HTML, CSS, JavaScript, and public assets (`robots.txt`, `sitemap.xml`, `favicon.svg`, `logo.svg`) into the **`dist/`** directory.
+
+---
+
+## 5. Hostinger VPS & CloudPanel Setup
+
+### Step 5.1: Create Static Site in CloudPanel
+1. Access your CloudPanel admin interface at `https://your-vps-ip:8443`.
 2. Navigate to **Sites** > **Add Site** > **Static Site**.
-3. Fill in:
+3. Fill in the site details:
    - **Domain Name**: `juanet.cloud`
-   - **Site User**: Select an existing site user or create a dedicated one (e.g., `juanet`).
-4. Note the site root path, typically:
+   - **Site User**: Select or create a dedicated user (e.g. `juanet`).
+   - **Application**: Static HTML / JS.
+4. Note your site document root path:
    ```bash
    /home/juanet/htdocs/juanet.cloud
    ```
 
----
+### Step 5.2: Configure DNS in Cloudflare / Hostinger
+Ensure your DNS records point to your Hostinger VPS IP:
+- **A Record**: `@` (or `juanet.cloud`) $\rightarrow$ `YOUR_HOSTINGER_VPS_IP`
+- **A or CNAME Record**: `www` $\rightarrow$ `YOUR_HOSTINGER_VPS_IP` (or `juanet.cloud`)
 
-## Step 2: Configure Environment & Run Production Build
+#### Cloudflare Proxy (Orange Cloud) vs Direct SSL Consideration:
+- **Initial Certificate Issuance**: If using Cloudflare proxy (orange cloud), set Cloudflare SSL/TLS encryption mode to **Full (Strict)**.
+- If CloudPanel Let's Encrypt validation fails due to Cloudflare proxying HTTP verification tokens, temporarily toggle Cloudflare to **DNS Only (Grey Cloud)**, issue the certificate in CloudPanel, and then toggle back to **Proxied (Orange Cloud)**.
 
-On your local workstation or CI/CD runner:
-
-1. Clone or export the repository:
-   ```bash
-   git clone https://github.com/your-org/juanet-cloud.git
-   cd juanet-cloud
-   ```
-
-2. Verify Node.js version (`>= 20.x`):
-   ```bash
-   node -v
-   ```
-
-3. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-4. Prepare your production `.env` file:
-   ```bash
-   VITE_SUPABASE_URL=https://your-project-id.supabase.co
-   VITE_SUPABASE_PUBLISHABLE_KEY=your-supabase-publishable-key
-   VITE_SITE_URL=https://juanet.cloud
-   VITE_CONTACT_EMAIL=contact@juanet.cloud
-   ```
-
-5. Run the production build:
-   ```bash
-   npm run build
-   ```
-   This generates the optimized static bundles in the `dist/` directory.
-
----
-
-## Step 3: Deploy Build Artifacts to Server
-
-Transfer the contents of `dist/` to the CloudPanel website root using `rsync` or SFTP:
-
-```bash
-# Using rsync (recommended)
-rsync -avz --delete dist/ juanet@your-server-ip:/home/juanet/htdocs/juanet.cloud/
-```
-
-Verify permissions on the server:
-```bash
-chown -R juanet:juanet /home/juanet/htdocs/juanet.cloud/
-chmod -R 755 /home/juanet/htdocs/juanet.cloud/
-```
-
----
-
-## Step 4: Configure HTTPS & Let's Encrypt SSL
-
+### Step 5.3: SSL / TLS Certificate in CloudPanel
 1. In CloudPanel, go to **Sites** > **juanet.cloud** > **SSL/TLS**.
 2. Click **New Let's Encrypt Certificate**.
-3. Ensure DNS records for `juanet.cloud` and `www.juanet.cloud` point to your VPS IP.
+3. Select both `juanet.cloud` and `www.juanet.cloud`.
 4. Click **Create and Install**.
 5. Enable **Force HTTPS**.
 
 ---
 
-## Step 5: Configure Nginx VHost for SPA Routing (Crucial)
+## 6. Configure Nginx VHost for Single-Page Application (SPA) Routing
 
-To ensure that direct visits or page refreshes on subroutes (such as `/services/web-development`, `/portfolio`, `/request-service`) render correctly rather than throwing an Nginx 404 error:
+Because React Router handles subroutes on the client (e.g. `/services/web-development`, `/request-service`, `/portfolio`), Nginx must rewrite all non-file requests to `/index.html`. Without this, refreshing a subroute causes an Nginx 404 error.
 
 1. In CloudPanel, go to **Sites** > **juanet.cloud** > **Vhost**.
-2. Locate the main `location /` block and update it as follows:
+2. Replace or update the server configuration with the following production-hardened template:
 
 ```nginx
 server {
@@ -106,32 +131,47 @@ server {
   server_name juanet.cloud www.juanet.cloud;
   root /home/juanet/htdocs/juanet.cloud;
 
-  # SSL certificates managed by CloudPanel
+  # Managed SSL certificates
   # {{ssl_certificate_key}}
   # {{ssl_certificate}}
 
   index index.html;
 
-  # Security headers
+  # Security Headers
   add_header X-Frame-Options "SAMEORIGIN" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header X-XSS-Protection "1; mode=block" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
-  # Cache static assets (JS, CSS, images, fonts)
-  location ~* \.(?:ico|css|js|gif|jpe?g|png|webp|svg|woff2?|ttf|eot)$ {
+  # Gzip Compression
+  gzip on;
+  gzip_vary on;
+  gzip_proxied any;
+  gzip_comp_level 6;
+  gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+  # Cache Static Assets (Vite hashed bundles in /assets/)
+  location /assets/ {
     expires 1y;
     add_header Cache-Control "public, max-age=31536000, immutable";
     access_log off;
     try_files $uri =404;
   }
 
-  # SPA Fallback for all React Router client paths
+  # Static Root Files (robots.txt, sitemap.xml, favicon.svg, logo.svg)
+  location ~* \.(?:ico|svg|png|jpg|jpeg|webp|xml|txt)$ {
+    expires 7d;
+    add_header Cache-Control "public, max-age=604800";
+    try_files $uri =404;
+  }
+
+  # SPA Routing Fallback: Route all navigation paths to index.html
   location / {
     try_files $uri $uri/ /index.html;
   }
 
-  # Disallow access to hidden files
+  # Deny Access to Hidden Files (.git, .env, etc.)
   location ~ /\. {
     deny all;
     access_log off;
@@ -139,50 +179,102 @@ server {
   }
 }
 ```
-
-3. Save the Vhost configuration. CloudPanel will automatically test and reload Nginx.
-
----
-
-## Step 6: Configure Supabase Allowed Origins
-
-1. Log into your Supabase project dashboard.
-2. Go to **Authentication** > **URL Configuration**.
-3. Under **Redirect URLs**, add:
-   - `https://juanet.cloud/**`
-   - `https://www.juanet.cloud/**`
-4. Under **Site URL**, set:
-   - `https://juanet.cloud`
+3. Save the VHost. CloudPanel validates syntax and reloads Nginx immediately.
 
 ---
 
-## Step 7: Post-Deployment Verification Checklist
+## 7. Deploying Build Artifacts to Hostinger VPS
 
-Execute these checks after every deployment:
+### Recommended: Zero-Downtime Symlink Deployment
+Run from your build machine / workstation:
 
-1. [ ] **Direct Navigation**: Visit `https://juanet.cloud/services/web-development` and press refresh. Verify the page reloads cleanly without an Nginx 404.
-2. [ ] **Asset Caching**: Open DevTools Network tab; verify CSS and JS files load with `200` / `304` and correct MIME types.
-3. [ ] **Missing Asset 404**: Request a non-existent asset (`/missing-file.png`). Verify it returns a genuine 404, **not** `index.html`.
-4. [ ] **SSL Validity**: Check browser lock icon for valid Let's Encrypt TLS certificate.
-5. [ ] **Form Submission**: Submit a test inquiry via `/contact` or `/request-service`. Verify that a valid reference code (`JN-XXX-2026-XXXX`) is displayed and the record is stored in Supabase.
-6. [ ] **Responsive Design**: Verify layout on mobile viewport and desktop viewport (1440px).
+```bash
+# Set your variables
+VPS_USER="juanet"
+VPS_HOST="your-vps-ip"
+RELEASE_TAG=$(date +%Y%m%d%H%M%S)
+
+# 1. Create releases directory on server
+ssh ${VPS_USER}@${VPS_HOST} "mkdir -p /home/juanet/releases/${RELEASE_TAG}"
+
+# 2. Upload dist contents
+rsync -avz --delete dist/ ${VPS_USER}@${VPS_HOST}:/home/juanet/releases/${RELEASE_TAG}/
+
+# 3. Atomically switch active symlink
+ssh ${VPS_USER}@${VPS_HOST} "ln -sfn /home/juanet/releases/${RELEASE_TAG} /home/juanet/htdocs/juanet.cloud"
+
+# 4. Enforce strict permissions
+ssh ${VPS_USER}@${VPS_HOST} "chmod -R 755 /home/juanet/releases/${RELEASE_TAG}"
+```
+
+### Direct Rsync Method (Alternative)
+```bash
+rsync -avz --delete dist/ juanet@your-vps-ip:/home/juanet/htdocs/juanet.cloud/
+```
 
 ---
 
-## Step 8: Rollback Procedure
+## 8. Supabase Backend & Edge Function Deployment
 
-To roll back quickly in case of an issue:
+The Edge Function handles validated submissions with structured JSON logging and burst rate limiting.
 
-1. Maintain versioned release directories on the server:
-   ```bash
-   /home/juanet/htdocs/releases/20261013-01/
-   /home/juanet/htdocs/releases/20261013-02/
-   ```
-2. Symlink `juanet.cloud` to the active release:
-   ```bash
-   ln -sfn /home/juanet/htdocs/releases/20261013-01 /home/juanet/htdocs/juanet.cloud
-   ```
-3. To roll back, simply re-point the symlink to the previous release folder:
-   ```bash
-   ln -sfn /home/juanet/htdocs/releases/20261013-01 /home/juanet/htdocs/juanet.cloud
-   ```
+### Automated via GitHub Actions
+Ensure these two secrets are configured in your GitHub repository (**Settings** > **Secrets and variables** > **Actions**):
+- `SUPABASE_ACCESS_TOKEN`: Your Personal Access Token from Supabase Dashboard > Account Settings > Access Tokens.
+- `SUPABASE_PROJECT_REF`: `qaxctkradwquzwyvrpfe`
+
+Any push modifying `supabase/functions/submit-inquiry/**` triggers the `.github/workflows/deploy-supabase-function.yml` workflow and deploys automatically.
+
+### Manual CLI Deployment (Alternative)
+```bash
+# Login to Supabase CLI
+supabase login
+
+# Link your project
+supabase link --project-ref qaxctkradwquzwyvrpfe
+
+# Deploy Edge Function without requiring public user JWT
+supabase functions deploy submit-inquiry --no-verify-jwt
+```
+
+---
+
+## 9. Live Verification Checklist
+
+Perform these checks on the live site (`https://juanet.cloud`):
+
+1. **Direct Navigation & Refresh Test**:
+   - Navigate directly to `https://juanet.cloud/services/web-development`.
+   - Press `Ctrl + F5` (hard refresh).
+   - Expected: Page renders smoothly without Nginx 404.
+2. **Missing Asset 404 Test**:
+   - Request `https://juanet.cloud/missing-asset.png`.
+   - Expected: Genuine 404 status, not `index.html`.
+3. **SEO & Crawl Assets**:
+   - Request `https://juanet.cloud/robots.txt` $\rightarrow$ Returns text/plain directives.
+   - Request `https://juanet.cloud/sitemap.xml` $\rightarrow$ Returns 21 catalog URLs.
+   - Request `https://juanet.cloud/favicon.svg` $\rightarrow$ Returns vector monogram.
+4. **Forms Live Testing**:
+   - **Contact Form** (`/contact`): Submit valid message $\rightarrow$ Expect reference code `JN-CON-2026-XXXX`.
+   - **Quotation Form** (`/request-service`): Complete 4-step wizard $\rightarrow$ Expect reference code `JN-QUO-2026-XXXX`.
+   - **Consultation Form** (`/book-consultation`): Submit meeting request $\rightarrow$ Expect reference code `JN-CON-2026-XXXX`.
+   - Check Supabase Dashboard > **Table Editor** > `inquiries` to verify rows.
+   - Check Supabase Dashboard > **Edge Functions** > `submit-inquiry` > **Logs** to verify structured JSON log entries.
+5. **Anti-Abuse Verification**:
+   - Submit a form with the hidden `honeypot` filled $\rightarrow$ Expect clean `400 Invalid submission.`
+   - Submit rapid repeated requests $\rightarrow$ Expect `429 Too many submissions.`
+
+---
+
+## 10. Instant Rollback Procedure
+
+If a release causes an unforeseen defect on the live site:
+
+```bash
+# List previous release directories
+ssh juanet@your-vps-ip "ls -la /home/juanet/releases/"
+
+# Re-point the symlink to the previous good release
+ssh juanet@your-vps-ip "ln -sfn /home/juanet/releases/PREVIOUS_RELEASE_TAG /home/juanet/htdocs/juanet.cloud"
+```
+The rollback takes effect in 0 seconds with zero downtime.

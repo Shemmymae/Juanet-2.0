@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" fill="none">
+  <rect width="320" height="80" rx="16" fill="#0B132B"/>
+  <!-- Monogram Box -->
+  <rect x="24" y="16" width="48" height="48" rx="12" fill="#1E1B4B" stroke="#4338CA" stroke-width="2"/>
+  <path d="M40 28v14a6 6 0 0 0 12 0V28" stroke="#8B5CF6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M52 38a6 6 0 0 0 6-6" stroke="#8B5CF6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Wordmark -->
+  <text x="88" y="49" font-family="system-ui, -apple-system, sans-serif" font-size="28" font-weight="800" fill="#FFFFFF" letter-spacing="-0.5">JUANET<tspan fill="#A78BFA" font-weight="600">.cloud</tspan></text>
+</svg>

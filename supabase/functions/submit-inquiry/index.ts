@@ -10,7 +10,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 // -----------------------------------------------------------------------------
 const ALLOWED_ORIGIN_PATTERNS = [
   /^https:\/\/(www\.)?juanet\.cloud$/,
-  /^http:\/\/localhost:(3000|5173)$/,
+  /^http:\/\/localhost:(3000|5173|4173)$/,
   /^https:\/\/.*\.run\.app$/,
 ];
 
@@ -31,7 +31,7 @@ function getCorsHeaders(originHeader: string | null): Record<string, string> {
 // Structured Logging Types & Helpers
 // Emits single-line JSON records formatted for cloud ingest and log parsers.
 // PII PROTECTION: Never log full names, email addresses, phone numbers,
-// request bodies, session tokens, or service-role keys.
+// raw IP addresses, request bodies, session tokens, or service-role keys.
 // -----------------------------------------------------------------------------
 interface LogContext {
   timestamp: string;
@@ -81,10 +81,63 @@ function getElapsedMs(startTime: number): number {
 }
 
 // -----------------------------------------------------------------------------
-// In-Memory Rate Limiting (Single-Isolate Burst Defense)
-// NOTE: In serverless environments, in-memory Maps are ephemeral to the active
-// V8 isolate. They mitigate rapid burst abuse on warm containers but do not
-// synchronize across global edge regions or cold starts.
+// Trusted Proxy IP Extraction & Sanitization
+// -----------------------------------------------------------------------------
+function isValidIp(ip: string): boolean {
+  // IPv4 validation (4 octets, 0-255 each)
+  const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+  if (ipv4Regex.test(ip)) {
+    return true;
+  }
+  // IPv6 validation (standard and compressed)
+  const ipv6Regex = /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^(([0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4})?::(([0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4})?$/;
+  return ipv6Regex.test(ip);
+}
+
+function extractClientIp(req: Request): string {
+  // 1. Cloudflare Connecting IP (highest trust when routed through Cloudflare / Deno Deploy)
+  const cfIp = req.headers.get('cf-connecting-ip')?.trim();
+  if (cfIp && isValidIp(cfIp)) {
+    return cfIp;
+  }
+
+  // 2. Nginx X-Real-IP (trusted upstream reverse proxy)
+  const realIp = req.headers.get('x-real-ip')?.trim();
+  if (realIp && isValidIp(realIp)) {
+    return realIp;
+  }
+
+  // 3. X-Forwarded-For (sanitized leftmost candidate)
+  const xForwardedFor = req.headers.get('x-forwarded-for');
+  if (xForwardedFor) {
+    const parts = xForwardedFor.split(',');
+    for (const part of parts) {
+      const candidate = part.trim();
+      if (isValidIp(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  // 4. Safe deterministic fallback if no valid IP header is provided
+  return 'unknown-client';
+}
+
+// -----------------------------------------------------------------------------
+// Cryptographic Salted SHA-256 IP Hasher
+// Protects visitor privacy by avoiding raw IP storage in database tables.
+// -----------------------------------------------------------------------------
+async function hashClientIp(ip: string): Promise<string> {
+  const salt = Deno.env.get('RATE_LIMIT_SALT') || 'juanet-production-salt-2026';
+  const encoder = new TextEncoder();
+  const data = encoder.encode(`${salt}:${ip}`);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// -----------------------------------------------------------------------------
+// In-Memory Rate Limiter (Single-Isolate Instant Burst Shield)
 // -----------------------------------------------------------------------------
 const rateLimitMap = new Map<string, { count: number; expiresAt: number }>();
 
@@ -126,32 +179,7 @@ serve(async (req) => {
   }
 
   try {
-    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'unknown';
-    const now = Date.now();
-
-    // 2. IP Rate Limiting (Burst mitigation: max 10 requests per 10 minutes)
-    const rateRecord = rateLimitMap.get(clientIp);
-    if (rateRecord && rateRecord.expiresAt > now) {
-      if (rateRecord.count >= 10) {
-        logStructured('warn', {
-          requestId,
-          event: 'rate_limit_rejected',
-          outcome: 'rate_limited',
-          httpStatus: 429,
-          elapsedMs: getElapsedMs(startTime),
-          reason: 'Rate limit threshold exceeded for client window',
-        });
-        return new Response(
-          JSON.stringify({ error: 'Too many submissions. Please wait a few minutes before trying again.' }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      rateRecord.count++;
-    } else {
-      rateLimitMap.set(clientIp, { count: 1, expiresAt: now + 10 * 60 * 1000 });
-    }
-
-    // 3. Request body size check (64KB payload cap)
+    // 2. Request body size check (64KB payload cap)
     const contentLength = req.headers.get('content-length');
     if (contentLength && parseInt(contentLength, 10) > 65536) {
       logStructured('warn', {
@@ -187,7 +215,7 @@ serve(async (req) => {
       );
     }
 
-    // 4. Honeypot check (Bots fill hidden fields)
+    // 3. Honeypot check (Bots fill hidden fields)
     if (payload.honeypot && String(payload.honeypot).trim().length > 0) {
       logStructured('warn', {
         requestId,
@@ -203,7 +231,7 @@ serve(async (req) => {
       );
     }
 
-    // 5. Validate mandatory fields
+    // 4. Validate mandatory fields
     const inquiryTypeRaw = typeof payload.inquiryType === 'string' ? payload.inquiryType.trim() : '';
     const validInquiryType = ['contact', 'quotation', 'consultation'].includes(inquiryTypeRaw)
       ? inquiryTypeRaw
@@ -276,7 +304,7 @@ serve(async (req) => {
       );
     }
 
-    // 6. Connect to Supabase using server-side service role key (trusted backend only)
+    // 5. Connect to Supabase using server-side service role key (trusted backend only)
     const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
 
@@ -298,12 +326,92 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // 7. Generate cryptographic reference code if not provided
+    // 6. Client IP Extraction and SHA-256 Hashing
+    const clientIp = extractClientIp(req);
+    const ipHash = await hashClientIp(clientIp);
+
+    // 7. In-Memory Burst Shield (Keyed by SHA-256 hash, max 10 requests per 10 minutes)
+    const now = Date.now();
+    const rateRecord = rateLimitMap.get(ipHash);
+    if (rateRecord && rateRecord.expiresAt > now) {
+      if (rateRecord.count >= 10) {
+        logStructured('warn', {
+          requestId,
+          event: 'rate_limit_rejected',
+          outcome: 'rate_limited',
+          httpStatus: 429,
+          elapsedMs: getElapsedMs(startTime),
+          inquiryType: validInquiryType,
+          reason: 'In-memory isolate burst limit exceeded',
+        });
+        return new Response(
+          JSON.stringify({ error: 'Too many submissions. Please wait a few minutes before trying again.' }),
+          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      rateRecord.count++;
+    } else {
+      rateLimitMap.set(ipHash, { count: 1, expiresAt: now + 10 * 60 * 1000 });
+    }
+
+    // 8. Durable Database Rate Limiting (Authoritative distributed limit)
+    const { data: isAllowed, error: rpcError } = await supabase.rpc('check_inquiry_rate_limit', {
+      p_ip_hash: ipHash,
+      p_max_requests: 10,
+      p_window_seconds: 600,
+    });
+
+    if (rpcError) {
+      // Postgres error 42883: function does not exist (migration pending in database)
+      if (rpcError.code === '42883') {
+        logStructured('warn', {
+          requestId,
+          event: 'config_error',
+          outcome: 'accepted',
+          httpStatus: 200,
+          elapsedMs: getElapsedMs(startTime),
+          inquiryType: validInquiryType,
+          reason: 'check_inquiry_rate_limit RPC not yet migrated in database; protected by in-memory burst shield',
+        });
+      } else {
+        // Genuine database failure: fail safely without silently disabling rate limiting
+        logStructured('error', {
+          requestId,
+          event: 'database_error',
+          outcome: 'error',
+          httpStatus: 500,
+          elapsedMs: getElapsedMs(startTime),
+          inquiryType: validInquiryType,
+          errorCode: rpcError.code || 'RATE_LIMIT_RPC_FAILURE',
+          reason: 'Rate limit RPC execution error',
+        });
+        return new Response(
+          JSON.stringify({ error: 'Unable to process inquiry at this time. Please try again later.' }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    } else if (isAllowed === false) {
+      logStructured('warn', {
+        requestId,
+        event: 'rate_limit_rejected',
+        outcome: 'rate_limited',
+        httpStatus: 429,
+        elapsedMs: getElapsedMs(startTime),
+        inquiryType: validInquiryType,
+        reason: 'Durable database rate limit exceeded',
+      });
+      return new Response(
+        JSON.stringify({ error: 'Too many submissions. Please wait a few minutes before trying again.' }),
+        { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // 9. Generate cryptographic reference code if not provided
     const year = new Date().getFullYear();
     const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
     const refCode = payload.referenceCode || `JN-${validInquiryType.substring(0, 3).toUpperCase()}-${year}-${rand}`;
 
-    // 8. Sanitize inputs and insert into inquiries table
+    // 10. Sanitize inputs and insert into inquiries table
     const serviceId = typeof payload.serviceSlug === 'string' ? payload.serviceSlug.slice(0, 100) : null;
     const projectSummary = typeof payload.projectSummary === 'string' ? payload.projectSummary.slice(0, 500) : null;
     const projectDetails = typeof (payload.projectDetails || payload.message) === 'string'
@@ -337,11 +445,11 @@ serve(async (req) => {
         consent_recorded_at: new Date().toISOString(),
         status: 'new',
         project_metadata: {
-          clientIp: clientIp,
+          ipHash: ipHash,
           serviceSlug: serviceId,
           intendedAudience: payload.intendedAudience ? String(payload.intendedAudience).slice(0, 200) : undefined,
           consultationTopic: payload.consultationTopic ? String(payload.consultationTopic).slice(0, 200) : undefined,
-          viaGateway: 'edge_function',
+          viaGateway: 'edge_function_durable_limiter',
         },
       },
     ]);
@@ -365,7 +473,7 @@ serve(async (req) => {
       );
     }
 
-    // 9. Structured log ONLY after database insertion has succeeded
+    // 11. Structured log ONLY after database insertion has succeeded
     logStructured('info', {
       requestId,
       event: 'inquiry_created',
