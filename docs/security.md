@@ -57,7 +57,11 @@ CREATE POLICY "Public visitors can submit valid inquiries"
 
 1. **Honeypot Technique**: All public forms include an invisible input field (`honeypot`). Real users cannot see or fill this input; automated scrapers and bots that fill all inputs are rejected immediately.
 2. **Client-side & Server-side Validation**: Field types, email formats, and mandatory consent are validated both in the React form state and at the database/edge level.
-3. **Edge Function Protection**: The optional Supabase Edge Function (`supabase/functions/submit-inquiry/index.ts`) enforces IP rate-limiting (maximum 10 requests per 10 minutes) and 64KB payload bounds.
+3. **Edge Function Protection & Structured Logging**: The Supabase Edge Function (`supabase/functions/submit-inquiry/index.ts`) enforces IP rate-limiting (maximum 10 requests per 10 minutes), 64KB payload bounds, and emits machine-parseable JSON structured logs:
+   - Tracks request receipt, validation rejection, rate-limit rejection, successful insertion, and unexpected exceptions.
+   - Includes unique `requestId` (UUID v4), valid `inquiryType`, outcome status, HTTP status code, and `elapsedMs`.
+   - **Zero-PII Logging Guarantee**: Full names, email addresses, phone numbers, free-form project descriptions, full request bodies, auth tokens, and `service_role` keys are strictly prohibited from log lines.
+   - Internal database errors and server exceptions are logged securely on the backend while public callers receive clean, sanitized generic responses.
 
 ---
 

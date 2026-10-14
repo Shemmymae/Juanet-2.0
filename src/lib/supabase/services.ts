@@ -185,7 +185,8 @@ export async function submitInquiry(payload: InquiryPayload): Promise<InquirySub
         }
       );
 
-      if (!edgeError && edgeData && edgeData.success) {
+      // 1. Explicit Edge Function success
+      if (!edgeError && edgeData && edgeData.success === true) {
         console.info('[JUANET.cloud] Inquiry successfully processed via Edge Function:', edgeData.referenceCode);
         return {
           success: true,
@@ -194,34 +195,56 @@ export async function submitInquiry(payload: InquiryPayload): Promise<InquirySub
         };
       }
 
-      const edgeStatus = (edgeError as any)?.context?.status;
-
-      // If Edge Function is not deployed (HTTP 404), mark as unavailable for fallback
-      if (edgeStatus === 404) {
-        functionUnavailable = true;
-        console.info('[JUANET.cloud] Edge Function submit-inquiry returned 404 (not deployed); using verified direct RLS table insert.');
-      } else if (edgeError) {
-        // Function is deployed and returned an intentional rejection or error (e.g. 400 validation, 429 rate limit, 500 error).
-        // DO NOT fall back to database; honor the server-side decision!
-        console.warn('[JUANET.cloud] Edge Function returned HTTP', edgeStatus || 'error');
-        let errorMsg = edgeError.message || 'Submission could not be completed.';
-        try {
-          const errBody = await (edgeError as any).context?.json();
-          if (errBody?.error) {
-            errorMsg = errBody.error;
-          }
-        } catch (_) {
-          // ignore json parse errors
-        }
+      // 2. Explicit Edge Function application-level rejection/error
+      if (!edgeError && edgeData && (edgeData.error || edgeData.success === false)) {
+        const errorMsg = typeof edgeData.error === 'string' ? edgeData.error : 'Submission could not be completed.';
+        console.warn('[JUANET.cloud] Edge Function returned application rejection:', errorMsg);
         return {
           success: false,
           referenceCode,
           message: errorMsg,
         };
       }
+
+      const edgeStatus = (edgeError as any)?.context?.status;
+      const errorName = (edgeError as any)?.name;
+
+      // 3. Only fall back to direct database insertion if the Edge Function is genuinely NOT DEPLOYED (HTTP 404) or relay not found
+      if (edgeStatus === 404 || errorName === 'FunctionsRelayError') {
+        functionUnavailable = true;
+        console.info('[JUANET.cloud] Edge Function submit-inquiry is not deployed (HTTP 404); falling back to direct RLS table insert.');
+      } else if (edgeError) {
+        // Function IS deployed and returned an intentional rejection or error (e.g. 400 validation, 413 size, 429 rate limit, 500 error).
+        // DO NOT fall back to database; honor the server-side rejection!
+        console.warn('[JUANET.cloud] Edge Function returned HTTP error:', edgeStatus || edgeError.message);
+        let errorMsg = 'Submission could not be completed. Please check your details and try again.';
+        try {
+          const errBody = await (edgeError as any).context?.json();
+          if (errBody?.error && typeof errBody.error === 'string') {
+            errorMsg = errBody.error;
+          }
+        } catch (_) {
+          if (edgeError.message) {
+            errorMsg = edgeError.message;
+          }
+        }
+        return {
+          success: false,
+          referenceCode,
+          message: errorMsg,
+        };
+      } else {
+        // Unexpected response payload format
+        console.warn('[JUANET.cloud] Edge Function returned unrecognized response structure:', edgeData);
+        return {
+          success: false,
+          referenceCode,
+          message: 'Unable to verify inquiry processing. Please contact us directly.',
+        };
+      }
     } catch (edgeInvokeErr: any) {
-      // If network failed to reach the functions endpoint entirely
-      console.warn('[JUANET.cloud] Edge Function invoke network error:', edgeInvokeErr);
+      // Network failure, unreachable endpoint, or CORS failure during invoke
+      console.warn('[JUANET.cloud] Edge Function invoke network error, falling back to direct database insert:', edgeInvokeErr);
       functionUnavailable = true;
     }
 
@@ -287,6 +310,13 @@ export async function submitInquiry(payload: InquiryPayload): Promise<InquirySub
         };
       }
     }
+
+    // Safety guard: If Supabase was configured and we reached here, do NOT fall through to offline preview mode
+    return {
+      success: false,
+      referenceCode,
+      message: 'Could not complete inquiry processing. Please contact us directly.',
+    };
   }
 
   // 5. If Supabase is not configured (e.g. initial clone before setting keys)
