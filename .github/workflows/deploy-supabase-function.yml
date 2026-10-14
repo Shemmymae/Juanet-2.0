@@ -1,0 +1,34 @@
+
+name: Deploy JUANET.cloud Supabase Edge Function
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "supabase/functions/submit-inquiry/**"
+      - ".github/workflows/deploy-supabase-function.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy submit-inquiry
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          supabase functions deploy submit-inquiry \
+            --project-ref "$SUPABASE_PROJECT_REF" \
+            --no-verify-jwt
